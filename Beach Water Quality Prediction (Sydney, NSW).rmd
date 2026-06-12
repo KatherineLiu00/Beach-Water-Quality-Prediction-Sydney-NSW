@@ -1,0 +1,1576 @@
+---
+title: "Beach Water Quality Prediction (Sydney, NSW)"
+author: "Katherine Liu"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+#    code_folding: hide
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Loading Packages
+library(tidyverse)
+library(here)
+library(dplyr)
+library(tibble)
+library(lubridate)
+library(caret)
+library(e1071)
+library(doParallel)
+library(caret)
+library(pROC)
+library(PRROC)
+library(ggplot2)
+library(naivebayes)
+library(kernlab)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = 'markup')
+
+# 定义一个 chunk hook，把代码+结果一起放到 <details> 里
+knitr::knit_hooks$set(chunk = function(x, options) {
+  paste0("<details><summary>CLICK TO EXPAND CODE</summary>\n\n",
+         x,
+         "\n</details>\n")
+})
+```
+# Problem Overview
+## Background, Stakeholders & Objective
+Beach water quality in New South Wales (NSW) directly affects public health, beach operations, and community confidence. Early, reliable signals of deteriorating conditions help **beachgoers** make safer choices, allow **councils** to target re-sampling or temporary advisories, and support **environmental agencies** in routine monitoring.
+
+**Objective**
+Using routinely collected **water-quality** measurements together with **local weather** information, we aim to **predict the daily beach status** (*Poor / Fair / Good*). The goal is not to replace expert judgement but to provide a data-driven, reproducible decision aid that balances:
+- Health risk (recall for *Poor* status)
+- Operational cost (precision for *Fair/Good* status)
+
+
+## Data Sources & Integration (Scope & Key Variables)
+We use two public datasets for Greater Sydney/NSW, integrated to form modelling samples:
+
+**1. Core Datasets**
+- **`water_quality.csv`** (Beachwatch official monitoring records)
+  - Key fields: site, council, date/time, *Enterococci* counts, water temperature, conductivity, coordinates
+- **`weather.csv`** (local daily weather summaries)
+  - Key fields: date, precipitation, max/min air temperature, etc.
+
+**2. Integration Rules**
+- Standardise the `date` field across both datasets
+- Perform a **left-join on `date`** to combine records
+- Unit of analysis: *one record per day per site* (daily weather variables shared across same-date rows)
+- Multi-sample days: Aggregation rule (e.g., latest sample, daily median) specified in *Data Preparation*
+
+
+
+## Problem Formulation & Assumptions
+
+We frame the task as **supervised multiclass classification**. The response variable `class` encodes daily beach status with three ordered levels (*Poor*, *Fair*, *Good*). If `class` is not provided in the raw data, it will be **derived from Enterococci thresholds** consistent with NSW guidance (details in *Data Preparation*). Predictors include routine **water-quality** measurements and **weather** summaries for the same day, optionally augmented by rolling weather windows and seasonal/context features.
+
+**Core assumptions:**
+
+**No leakage**: Features at day t exclude future data; all preprocessing and tuning occur within folds or chronological splits.<br>
+**Representativeness**: Splits mirror real deployment (sites, councils, seasons); site/year-wise validation handles distribution shifts.<br>
+**Well-posed target**:`Poor/Fair/Good` labels follow fixed policy, applied post unit-of-analysis setup.<br>
+**Measurement consistency**: Weather data match local sampling conditions; repeated same-day samples are aggregated or modeled.
+
+
+
+
+# Dataset Description
+
+## Data Source
+Final datasets **combined_data.csv** combined form (`water_quality.csv` and `weather.csv`), sourced from: <br>
+NSW Beachwatch Water Quality Data Portal: https://www.beachwatch.nsw.gov.au/waterMonitoring/waterQualityData.
+
+
+```{r}
+water_quality <- read.csv(here("water_quality.csv"))
+weather <- read.csv(here("weather.csv"))
+
+# Combine two datasets based on "date"
+combined_data <- water_quality %>%
+  left_join(weather, by = "date")
+
+head(combined_data)
+```
+
+
+## Data Description 
+```{r}
+dim(water_quality)
+str(water_quality)
+
+dim(weather)
+str(weather)
+
+dim(combined_data)
+str(combined_data)
+```
+The **`water_quality.csv`** dataset has **123,530 samples** with **10 variables**:
+
+**5 categorical:** `region`, `council`, `swim_site`, `date`, `time`.
+**5 numerical:** `enterococci_cfu_100ml`, `water_temperature_c`, `conductivity_ms_cm`, `latitude`, `longitude`.
+
+The **`weather.csv`** dataset has **12,538 samples** with **6 variables**:
+
+**1 categorical/temporal:** `date`.
+**5 numerical:** `max_temp_C`, `min_temp_C`, `precipitation_mm`, `latitude`, `longitude`.
+
+The **`combined_data`** contains **123,530 samples** with **15 variables**, including:
+
+**5 categorical:** `region`, `council`, `swim_site`, `date`, `time`.
+**10 numerical:** `enterococci_cfu_100ml`, `water_temperature_c`, `conductivity_ms_cm`, `max_temp_C`, `min_temp_C`, `precipitation_mm`, `latitude.x`, `longitude.x`, `latitude.y`, `longitude.y`.
+
+The **`combined_data`** merges **water_quality** and **weather**, integrating categorical and continuous features to support **classification** and **predictive modeling**.
+
+
+**Target Variable (class):**
+For modeling purposes, the numeric variable `enterococci_cfu_100ml` will be converted into a categorical water quality indicator `class` according to NSW guidelines:
+
+**Good:** ≤ 200 CFU/100ml.
+**Fair:** 200 – 500 CFU/100ml.
+**Poor:** > 500 CFU/100ml.
+
+## Datasets Challenges
+
+**1. Missing values**:
+After merging, 123,530 records remain, but some swim sites lack weather data on certain dates.
+
+**2. Duplicate and Redundant Variables**:
+Fixed coordinates (latitude.y/longitude.y) can be removed to reduce complexity and multicollinearity.
+
+**3. Scale Differences**:
+Numeric features vary widely (e.g., enterococci 0–11M vs temperature 0–1,040), requiring standardization for distance- or gradient-based models.
+
+**4. Potential Outliers**:
+Extreme values in enterococci_cfu_100ml, water_temperature_c, and conductivity_ms_cm may distort models and need careful handling.
+
+
+
+```{r}
+summary(combined_data)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Exploratory Data Analysis
+
+## Missing Values
+
+Missing values were assessed across all variables. The table shows the proportion of missing data per variable, while the figure highlights those with higher missing rates that may require imputation or exclusion.
+
+```{r}
+#Calculate missing rate for each variable
+miss_df <- sapply(combined_data, function(x) mean(is.na(x))) %>%
+  tibble::enframe(name = "variable", value = "missing_rate") %>%
+  arrange(desc(missing_rate))
+
+miss_df
+```
+
+
+## Distribution of Target Variables
+
+The target variable enterococci_cfu_100ml shows a highly right-skewed distribution with several extreme outliers. To improve interpretability and support subsequent analysis, a log transformation was applied.
+
+```{r}
+combined_data <- combined_data %>%
+  mutate(log_enterococci = ifelse(enterococci_cfu_100ml > 0,
+                                  log1p(enterococci_cfu_100ml), NA))
+
+ggplot(combined_data, aes(x = log_enterococci)) +
+  geom_histogram(bins = 50, na.rm = TRUE) +   #silently drop NA within geoms
+  geom_density(adjust = 1, na.rm = TRUE) +
+  labs(title = "Log-transformed Distribution of Enterococci",
+       x = "log(Enterococci + 1)",
+       y = "Count / Density")
+```
+
+The log transformation effectively reduces the strong skewness in enterococci_cfu_100ml, yielding a more balanced distribution that is easier to interpret and better suited for statistical modeling and classification.
+
+## Distribution of binned target variable
+
+```{r}
+combined_data <- combined_data %>%
+  mutate(
+    # build class label
+    class = case_when(
+      enterococci_cfu_100ml <= 200 ~ "Good",
+      enterococci_cfu_100ml >= 201 & enterococci_cfu_100ml <= 500 ~ "Fair",
+      enterococci_cfu_100ml > 500 ~ "Poor",
+    ),
+    class = factor(class, levels = c("Good","Fair","Poor"))
+  )
+class_dist <- combined_data %>%
+  filter(!is.na(class)) %>%
+  count(class, name = "n") %>%
+  mutate(pct = n / sum(n))
+
+ggplot(class_dist, aes(x = class, y = n, fill = class)) +
+  geom_col(width = 0.7, color = "white") +
+  geom_text(
+    aes(label = paste0(n, " (", scales::percent(pct, accuracy = 0.1), ")")),
+    vjust = -0.4, size = 4
+  ) +
+  labs(title = "Distribution of Binned Target Variable (Enterococci Class)",
+       x = "Target Class", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+The binned target variable is highly imbalanced. The Good class accounts for 95.3% of observations, while Fair and Poor comprise only 2.3% and 2.4%.
+
+
+## Relationship between Enterococci and Water Temperature
+
+Enterococci–environment relationships were visualized: scatterplots reveal temperature associations, and log-scaling reduces skewness for clearer interpretation.
+
+```{r}
+#Scatterplot: enterococci vs water temperature
+ggplot(
+  combined_data %>%
+    filter(enterococci_cfu_100ml > 0,         
+           is.finite(water_temperature_c)),   
+  aes(x = water_temperature_c, y = enterococci_cfu_100ml)
+) +
+  geom_point(alpha = 0.3) +
+  scale_y_log10() +
+  labs(
+    title = "Enterococci vs Water Temperature",
+    x = "Water Temperature (°C)",
+    y = "Enterococci (cfu/100ml, log scale)"
+  )
+```
+Scatterplots reveal counts generally rise with warmer water temperatures, suggesting environmental and spatial factors influence microbial water quality.
+
+
+## Summary of Findings
+
+**Missing values**:
+All variables are complete after cleaning. There are no missing values in the combined dataset, which means that we are not introducing any bias in the subsequent analysis due to imputation or deletion.<br>
+**Outliers**:
+The `enterococci_cfu_100ml` variable is highly right-skewed: there are many observations with small values and fewer observations with large values.<br>
+**Relationship**:
+Plotting enterococci versus water temperature shows that enterococci counts vary greatly across the observed range. There is a slight increase at high water temperature, but the relationship is weak. This suggests that water temperature is not a strong predictor of enterococci.<br>
+**Visualization**:
+Histograms and density plots highlight the strong skewness of the target variable. Applying a log transformation makes the results more interpretable and allows patterns to be more easily discerned on the original scale, justifying its use when classifying or grouping.
+
+
+
+
+# Feature Engineering
+## Data Cleaning
+```{r}
+combined_data <- combined_data |> 
+  dplyr::select(-latitude.y, -longitude.y)
+```
+**Remove Redundant Variables**: `latitude.y`, `longitude.y` (weather station coordinates, duplicated). 
+
+```{r}
+# check missing value
+colSums(is.na(combined_data))
+
+# Remove rows where 'enterococci_cfu_100ml' is NA
+combined_data <- combined_data %>% filter(!is.na(enterococci_cfu_100ml))
+
+# Remove rows where 'time' is NA
+combined_data <- combined_data %>% filter(!is.na(time))
+```
+**Remove rows with missing value**: in `enterococci_cfu_100ml`, `time`.
+
+
+```{r}
+combined_data <- combined_data %>% filter(precipitation_mm >= 0)
+combined_data <- combined_data %>% filter(water_temperature_c >= 0)
+combined_data <- combined_data %>% filter(conductivity_ms_cm >= 0)
+```
+**Remove Negative Outliers**: `precipitation_mm `, `water_temperature_c`, `conductivity_ms_cm` **< 0**.
+(Only data line within physical laws).
+
+
+```{r}
+# Month means across all years (fallback)
+month_median_all_years <- combined_data %>%
+  mutate(month = lubridate::month(date)) %>%
+  group_by(month) %>%
+  summarise(
+    wt_month_median_all   = median(water_temperature_c, na.rm = TRUE),
+    cond_month_median_all = median(conductivity_ms_cm,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Year-month means
+ym_median <- combined_data %>%
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date)) %>%
+  group_by(year, month) %>%
+  summarise(
+    wt_ym_median = median(water_temperature_c, na.rm = TRUE),
+    cond_ym_median = median(conductivity_ms_cm,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# prefer year-month mean, else fallback to all-years same-month mean
+combined_data <- combined_data %>%
+  mutate(year = lubridate::year(date),
+         month = lubridate::month(date)) %>%
+  left_join(ym_median, by = c("year","month")) %>%
+  left_join(month_median_all_years, by = "month") %>%
+  mutate(
+    water_temperature_c = ifelse(
+      is.na(water_temperature_c),
+      dplyr::coalesce(wt_ym_median, wt_month_median_all),
+      water_temperature_c
+    ),
+    conductivity_ms_cm = ifelse(
+      is.na(conductivity_ms_cm),
+      dplyr::coalesce(cond_ym_median, cond_month_median_all),
+      conductivity_ms_cm
+    )
+  ) %>%
+  select(-wt_ym_median, -cond_ym_median, -wt_month_median_all, -cond_month_median_all, -date)
+colSums(is.na(combined_data))
+```
+**Missing Value Imputation**: `water_temperature_c` and `conductivity_ms_cm` missing value -- medians imputation.
+
+
+
+```{r}
+cap <- function(x, lower_q = 0.01, upper_q = 0.99) {
+  qnt <- quantile(x, probs = c(lower_q, upper_q), na.rm = TRUE)
+  x[x < qnt[1]] <- qnt[1]
+  x[x > qnt[2]] <- qnt[2]
+  return(x)
+}
+
+combined_data$enterococci_cfu_100ml <- cap(combined_data$enterococci_cfu_100ml)
+combined_data$water_temperature_c <- cap(combined_data$water_temperature_c)
+combined_data$conductivity_ms_cm  <- cap(combined_data$conductivity_ms_cm)
+```
+
+**Outlier Handling**: `enterococci_cfu_100ml`, `water_temperature_c`, `conductivity_ms_cm` -- `1-99th` percentiles bounds, control extremes.
+
+
+
+```{r}
+summary(combined_data)
+```
+
+
+## Feature Scaling and Construction
+```{r}
+num_vars <- c("water_temperature_c", "precipitation_mm", "conductivity_ms_cm")
+combined_data[num_vars] <- scale(combined_data[num_vars])
+```
+**Scale Key Numerical Features**: `water_temperature_c`: 14–25, `precipitation_mm`: 0–67.6, `conductivity_ms_cm`: 73–55,300, different scales -- Standardize (z-score). 
+
+
+```{r}
+combined_data <- combined_data %>%
+  mutate(
+    # build class label
+    class = case_when(
+      enterococci_cfu_100ml <= 200 ~ "Good",
+      enterococci_cfu_100ml >= 201 & enterococci_cfu_100ml <= 500 ~ "Fair",
+      enterococci_cfu_100ml > 500 ~ "Poor",
+    ),
+    class = factor(class, levels = c("Good","Fair","Poor"))
+  )
+```
+**Build 3-class labels**: class: `Good`<=200, 200<`Fair`<=500, `Poor`>500 from `enterococci_cfu_100ml`.
+
+
+```{r}
+summary(combined_data)
+```
+
+## Feature Transformation and Interaction
+Improve minority class `Fair` and `Poor` model performance.
+```{r}
+# 1. Log transform enterococci and conductivity
+combined_data <- combined_data %>%
+  mutate(log_enterococci = log1p(enterococci_cfu_100ml))           # log transform enterococci
+
+
+# 2. Yeo-Johnson transform for precipitation_mm
+preProc <- preProcess(combined_data %>% select(precipitation_mm), method = "YeoJohnson")
+combined_data$yeojohnson_precip <- predict(preProc, combined_data %>% select(precipitation_mm))$precipitation_mm
+# Extract transformed precipitation
+
+# 3. Create interaction features and derived features
+combined_data <- combined_data %>%
+  mutate(
+    temp_ec_interact = water_temperature_c * log_enterococci,       
+    temp_diff = max_temp_C - min_temp_C                      
+  )
+```
+**Non-linear transformation of key variables**: `enterococci_cfu_100ml` -> `log_enterococci`, `precipitation_mm` -> `yeojohnson_precip`.
+**Interaction and difference features**: `temp_ec_interact`=`water_temperature_c*log_enterococci`, `temp_diff=`max_temp_C-min_temp_C`.
+
+
+```{r}
+combined_data <- combined_data %>%
+  mutate(
+    season = case_when(
+      month %in% c(12,1,2) ~ "Summer",
+      month %in% c(3,4,5)  ~ "Autumn",
+      month %in% c(6,7,8)  ~ "Winter",
+      TRUE ~ "Spring"
+    ),
+    season = factor(season, levels = c("Summer", "Autumn", "Winter", "Spring"))
+  )
+```
+**Time and seasonal features**: `month` -> `season`.
+
+```{r}
+summary(combined_data)
+```
+
+```{r}
+write.csv(combined_data, here("combined_data.csv"))
+```
+
+
+## Split Dataset and Handle Class Imbalance
+```{r}
+set.seed(5003)
+
+# Split data into training (80%) and testing (20%) sets
+train_index <- createDataPartition(combined_data$class, p = 0.8, list = FALSE)
+train_data <- combined_data[train_index, ]
+test_data <- combined_data[-train_index, ]
+
+# Check the original class distribution in the training set
+table(train_data$class)
+```
+**Split dataset**: **training (80%)**, **testing (20%)** before model training.
+
+```{r}
+train_data_balanced <- downSample(
+  x = train_data %>% select(log_enterococci, yeojohnson_precip, temp_ec_interact, temp_diff, season),  
+  y = train_data$class
+)
+train_data_balanced <- train_data_balanced %>% rename(class = Class)
+
+# Check the balanced class distribution in the training set
+table(train_data_balanced$class)
+```
+**Handling Class Imbalance (Downsampling within Training Set Only)**:
+Since the target variable `class` is extremely imbalanced, **down-sampling** was applied only to the training set to balance the classes, test set remains imbalanced, reflecting real-world performance.
+
+```{r}
+# Set up parallel computing
+cl <- makeCluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+train_control <- trainControl(
+  method = "cv",                 # 10-fold cross-validation
+  number = 10,
+  classProbs = TRUE,             # Enable probability predictions
+  summaryFunction = multiClassSummary,  # Evaluate multi-class metrics
+  allowParallel = TRUE           # Enable multi-core processing
+)
+```
+**10-Fold Cross-Validation with Parallel Training**: To optimize model training and evaluate performance robustly, CV - robust estimate of generalization, Parallel - accelerates computation.
+
+
+
+# Classification Models Used 
+## Multinomial Logistic Regression
+
+**Model & Features**: A Multinomial Logistic Regression model was trained on standardized engineered predictors (yeojohnson_precip, temp_ec_interact, temp_diff, season).
+
+**Hyperparameter Tuning**: Across folds, cross-validated performance was uniform over different values of decay, with the best mean accuracy at the highest regularization (decay ≈ 1.0). Since variance is low across folds, the model is not very sensitive to the strength of the penalty.
+
+```{r multinomial_model, message=FALSE, warning=FALSE}
+grid <- expand.grid(decay = c(0, 0.001, 0.01, 0.1, 0.5, 1))
+
+mlr_model <- train(
+  class ~ .,
+  data       = train_data_balanced,
+  method     = "multinom",
+  trControl  = train_control, 
+  tuneGrid   = grid,
+  preProcess = c("center", "scale"),
+  trace      = FALSE,
+  MaxNWts    = 5000
+)
+
+pred_cls <- predict(mlr_model, newdata = test_data)
+pred_prb <- predict(mlr_model, newdata = test_data, type = "prob")
+
+confusionMatrix(pred_cls, reference = test_data$class)
+```
+**Test Performance**: Accuracy: 0.9928 (95% CI: 0.9907–0.9945), Kappa: 0.8994 — strong overall agreement.
+
+**Per-class metrics**:
+•	Good: Recall 0.993, Precision 1.000, Balanced Accuracy 0.996.
+•	Fair: Recall 1.000, Precision 0.706, Balanced Accuracy 0.996.
+•	Poor: Recall 0.992, Precision 1.000, Balanced Accuracy 0.996.
+
+**Interpretation**:The model reliably distinguishes all classes. Lower Fair precision reflects class imbalance; a few non-linear or interaction terms could further improve minority-class predictions.
+
+
+
+## Linear Discriminant Analysis (LDA)
+
+```{r}
+lda_model <- train(
+  class ~ .,
+  data        = train_data_balanced,
+  method      = "lda",
+  preProcess  = c("center", "scale"),
+  trControl   = train_control 
+)
+
+pred_class <- predict(lda_model, newdata = test_data)
+confusionMatrix(pred_class, test_data$class)
+pred_prob <- predict(lda_model, newdata = test_data, type = "prob")
+
+```
+**Before Hyperparameter Tuning**: 
+The model achieved Accuracy = 0.9022 (95% CI: 0.8955–0.9086) and Kappa = 0.3692, indicating weak agreement beyond chance. Accuracy was below the No Information Rate (0.9667), reflecting strong class imbalance.
+
+**Performance by Class:**
+•	Good: Recall = 0.902, Precision = 1.000 — strong detection, minor confusion with Fair.
+•	Fair: Recall = 0.849, Precision = 0.134 — poor precision due to heavy misclassification.
+•	Poor: Recall = 0.977, Precision = 0.857 — high accuracy and minimal confusion.
+
+**Interpretation:**
+Before tuning, the model performs well on Good and Poor classes but struggles with Fair due to imbalance and overlapping features. Results highlight the limits of linear boundaries under skewed class distributions.
+
+
+```{r}
+lda_model_tuned <- train(
+  class ~ .,
+  data        = train_data_balanced,
+  method      = "lda",
+  preProcess  = c("center", "scale"),
+  trControl   = train_control,
+  tuneGrid    = data.frame(parameter = "none"),
+  prior = c(0.35, 0.35, 0.3) 
+)
+
+pred_class_tuned <- predict(lda_model_tuned, newdata = test_data)
+confusionMatrix(pred_class_tuned, test_data$class)
+pred_prob_tuned <- predict(lda_model_tuned, newdata = test_data, type = "prob")
+```
+**After Hyperparameter Tuning**:
+The model achieved Accuracy = 0.9029 (95% CI: 0.8963–0.9093) and Kappa = 0.374, showing slight improvement over pre-tuning performance. Accuracy remains below the NIR (0.9667), reflecting ongoing class imbalance.
+
+**Performance by Class:**
+•	Good: Recall = 0.902, Precision = 1.000 — stable, no false positives.
+•	Fair: Recall = 0.914, Precision = 0.142 — improved recall and balance, better detection of Fair samples.
+•	Poor: Recall = 0.953, Precision = 0.911 — improved precision, minor recall drop.
+
+**Interpretation:**
+After tuning, the model shows small but consistent improvements in accuracy and Kappa, with the Fair class gaining the most in recall and balance. Regularization (decay = 1.0) enhances generalization and reduces majority-class bias, leading to more balanced performance. However, linear separability still limits the model’s ability to fully distinguish overlapping minority classes.
+
+
+
+## Support Vector Machine (SVM)
+
+**Rationale**: We use an RBF-kernel SVM to capture possible non-linear boundaries. Predictors are centred/scaled. We first fit a **no-CV baseline** (fast), then a **tiny 2-fold CV** with a small grid for a quick improvement.
+
+```{r svm_dropin_once, echo=TRUE, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(tidyr); library(caret); library(kernlab); library(knitr)
+})
+set.seed(42)
+
+dat <- read_csv("combined_data.csv", show_col_types = FALSE)
+
+if (!("class" %in% names(dat))) {
+  y_guess <- grep("^(class|grade|status|risk)$", names(dat), ignore.case = TRUE, value = TRUE)
+  if (length(y_guess) == 0) stop("Please rename your label column to 'class' (or one of: class/grade/status/risk).")
+  dat <- dplyr::rename(dat, class = !!rlang::sym(y_guess[1]))
+}
+
+dat <- dat %>%
+  mutate(
+    across(where(is.character), as.factor),
+    across(where(is.logical),  as.factor),
+    across(where(function(x) inherits(x, "Date")), as.numeric),
+    across(where(function(x) inherits(x, "POSIXct")), as.numeric)
+  )
+
+good_cols <- names(dat)[vapply(dat, function(x) is.numeric(x) || is.factor(x), logical(1))]
+keep_all  <- unique(c("class", setdiff(good_cols, "class")))
+dat <- dat %>% select(all_of(keep_all))
+
+dat <- dat %>%
+  filter(!is.na(class)) %>%
+  mutate(class = factor(as.character(class), levels = c("Poor","Fair","Good"), ordered = TRUE)) %>%
+  tidyr::drop_na()
+stopifnot("class" %in% names(dat))
+
+idx   <- createDataPartition(dat$class, p = 0.8, list = FALSE)
+train <- dat[idx, , drop = FALSE]
+test  <- dat[-idx, , drop = FALSE]
+
+nz <- nearZeroVar(train %>% select(-class))
+if (length(nz) > 0) {
+  drop_names <- names(train %>% select(-class))[nz]
+  train <- train %>% select(-all_of(drop_names))
+  test  <- test  %>% select(all_of(names(train)))
+}
+
+ctrl_none <- trainControl(method = "none")
+num_mat <- train %>% select(where(is.numeric)) %>% as.matrix()
+if (nrow(num_mat) > 1500) num_mat <- num_mat[sample.int(nrow(num_mat), 1500), , drop = FALSE]
+sg <- tryCatch(as.numeric(kernlab::sigest(num_mat, frac = 1)[2]), error = function(e) NA)
+if (is.na(sg)) sg <- 0.1
+
+svm_base <- train(
+  class ~ ., data = train,
+  method = "svmRadial",
+  preProcess = c("center","scale"),
+  trControl = ctrl_none,
+  tuneGrid  = data.frame(sigma = sg, C = 1),
+  metric    = "Accuracy"
+)
+
+pred0 <- predict(svm_base, newdata = test)
+cm0   <- confusionMatrix(pred0, test$class)
+
+cat("**Baseline (no CV)**\n")
+kable(t(round(cm0$overall[c("Accuracy","Kappa")], 4)), col.names = c("Accuracy","Kappa"))
+kable(round(as.data.frame(cm0$byClass)[, c("Precision","Recall","F1")], 4))
+
+ctrl_fast <- trainControl(method = "cv", number = 2, summaryFunction = defaultSummary)
+grid <- expand.grid(sigma = sg * c(0.8, 1, 2), C = c(1, 5))
+
+svm_tune <- train(
+  class ~ ., data = train,
+  method = "svmRadial",
+  preProcess = c("center","scale"),
+  trControl = ctrl_fast,
+  tuneGrid  = grid,
+  metric    = "Accuracy"
+)
+
+pred <- predict(svm_tune, newdata = test)
+cm   <- confusionMatrix(pred, test$class)
+
+cat("\n**Tuned (2-fold CV, small grid)**\n")
+kable(svm_tune$bestTune, row.names = FALSE)
+kable(data.frame(CV_Best_Accuracy = round(max(svm_tune$results$Accuracy, na.rm = TRUE), 4)))
+kable(t(round(cm$overall[c("Accuracy","Kappa")], 4)), col.names = c("Accuracy","Kappa"))
+kable(round(as.data.frame(cm$byClass)[, c("Precision","Recall","F1")], 4))
+```
+Using 3-fold CV and a compact grid, the tuned RBF-SVM achieved strong performance (σ ≈ 0.0343, C = 5, CV accuracy = 0.9855). On the test set, it reached Accuracy = 0.9909 and Kappa = 0.8500, showing solid agreement beyond chance.
+
+**Per-class metrics**:
+•	Good: Precision 0.994, Recall 0.999, F1 0.996.
+•	Poor: Precision 0.935, Recall 0.892, F1 0.913.
+•	Fair: Precision 0.841, Recall 0.648, F1 0.732.
+
+The model excels on Good, maintains high Poor recall (~0.89), but Fair recall is lower (~0.65), reflecting difficulty in predicting the middle class.
+
+**Actionable next steps (to improve Fair performance without increasing false alarms):**
+
+**Thresholding / class-specific operating points:** Tune decision thresholds using per-class PR curves to improve Fair recall at a controlled precision loss.
+**Mild rebalancing or costs:** Apply in-fold up-sampling or class weights (higher weight on Fair) within `trainControl` to trade a small drop in overall accuracy for better Fair sensitivity.
+**Feature diagnostics:** Use permutation importance and partial-dependence on weather/season features to identify where Fair–Good boundaries blur; this can guide targeted feature engineering.
+
+Overall, the tuned SVM delivers **state-of-the-art accuracy** with robust Poor recall and a clear path to enhance Fair classification.
+
+
+## K-nearest Neighbors (KNN)
+```{r}
+knn_model <- train(
+  class ~ .,
+  data        = train_data_balanced,
+  method      = "knn",
+  preProcess  = c("center", "scale"),
+  tuneGrid    = data.frame(k = 5), 
+  trControl   = train_control 
+)
+
+pred_class <- predict(knn_model, newdata = test_data)
+confusionMatrix(pred_class, test_data$class)
+pred_prob <- predict(knn_model, newdata = test_data, type = "prob")
+```
+**K-nearest Neighbors (KNN) – Baseline Performance (Before Tuning)**
+Accuracy: 0.9377 (95% CI: 0.9322–0.9429).
+Kappa: 0.4725 -> moderate agreement.
+
+Per-class:
+•	Good: Recall 0.942, Precision 1.000 -> near-perfect classification.
+•	Fair: Recall 0.806, Precision 0.196 -> frequent false positives.
+•	Poor: Recall 0.814, Precision 0.714 -> balanced but some confusion with Fair.
+
+**Interpretation:** KNN performs excellently on the majority Good class but struggles with Fair due to high class overlap. Poor is reasonably well detected, though minor misclassification persists.
+
+  
+```{r}
+
+knn_grid <- expand.grid(
+  k = c(3,5,7,9,11,13,15,21,31)
+)
+
+knn_tune <- train(
+  class ~ .,
+  data       = train_data_balanced,
+  method     = "knn",
+  preProcess = c("center","scale"),  
+  tuneGrid   = knn_grid,
+  trControl  = train_control,
+  metric     = "Mean_F1"       
+)
+
+knn_tune$bestTune
+plot(knn_tune)
+
+pred_class <- predict(knn_tune, newdata = test_data)
+confusionMatrix(pred_class, test_data$class)
+
+pred_prob <- predict(knn_tune, newdata = test_data, type = "prob")
+head(pred_prob)
+
+```
+**KNN – After Hyperparameter Tuning**
+Optimal k = 5 -> best balance between bias and variance.
+Accuracy: 0.9380.
+Kappa: 0.4746 -> moderate agreement.
+
+Per-class:
+•	Fair: Recall 0.813, Precision 0.198 -> strong recall, low precision.
+•	Poor: Recall 0.814, Precision 0.724 -> balanced, slightly improved.
+
+**Summary:** After hyperparameter tuning, the KNN model with k = 5 maintains high accuracy with reduced overfitting. The Good class remains well classified, Poor balanced, while Fair continues to be the most difficult due to frequent false positives.
+
+
+## Naive Bayes
+```{r}
+nb_model <- train(
+  class ~ .,
+  data = train_data_balanced,
+  method = "naive_bayes",
+  trControl = train_control
+)
+
+# Evaluation on the **original imbalanced test set** to assess the model’s real-world performance.
+pred_class <- predict(nb_model, newdata = test_data)
+confusionMatrix(pred_class, test_data$class)
+```
+**Naive Bayes – Before Hyperparameter Tuning**
+Accuracy: 0.9771.
+Kappa: 0.7358 -> strong overall agreement but class imbalance persists.
+
+Per-class:
+•	Good: PPV 1.000, Sensitivity 0.976 -> near-perfect performance.
+•	Fair: PPV 0.647 -> moderate precision.
+•	Poor: PPV 0.542 -> frequent confusion with Good.
+
+**Summary:**
+Excellent accuracy driven by the dominant Good class, but Fair and Poor remain harder to distinguish, suggesting a need for tuning or resampling to improve minority detection.
+
+	
+```{r}
+# Define tuning grid for Naive Bayes
+nb_grid <- expand.grid(
+  usekernel = c(TRUE, FALSE),
+  laplace = c(0, 1, 5, 10),
+  adjust = c(0.1, 0.5, 1, 2)
+)
+
+nb_model_tune <- train(
+  class ~ .,
+  data = train_data_balanced,
+  method = "naive_bayes",
+  trControl = train_control,
+  tuneGrid = nb_grid
+)
+
+# Evaluation on the **original imbalanced test set** to assess the model’s real-world performance.
+pred_class <- predict(nb_model_tune, newdata = test_data)
+confusionMatrix(pred_class, test_data$class)
+```
+**Naive Bayes – After Hyperparameter Tuning**:
+Accuracy: 0.9818.
+Kappa: 0.7786 -> improved balance and stronger agreement across classes.
+
+Per-class:
+•	Fair: PPV 0.513, Recall 1.00 -> all Fair cases detected, though with some false positives.
+•	Poor: PPV 0.901, Recall 0.985 -> major improvement in minority detection.
+•	Good: near-perfect precision and recall, still slightly dominant.
+
+**Summary:**
+Tuning markedly boosts accuracy and minority-class recall, delivering a more balanced, reliable model despite residual bias toward the Good class.
+
+
+
+
+
+
+
+
+
+
+# Performance Evaluation 
+## Multinomial Logistic Regression
+```{r}
+# Predictions
+pred_cls <- predict(mlr_model, newdata = test_data)
+pred_prb <- predict(mlr_model, newdata = test_data, type = "prob")
+
+# Confusion matrix + accuracy/kappa
+cm <- confusionMatrix(pred_cls, reference = test_data$class)
+cm
+```
+```{r}
+acc      <- unname(cm$overall["Accuracy"])
+acc_low  <- unname(cm$overall["AccuracyLower"])
+acc_up   <- unname(cm$overall["AccuracyUpper"])
+kappa    <- unname(cm$overall["Kappa"])
+
+list(
+  Accuracy = acc,
+  Accuracy_95CI = c(acc_low, acc_up),
+  Kappa = kappa
+)
+```
+```{r}
+byc <- as.data.frame(cm$byClass)
+rec <- byc[,"Sensitivity"]
+pre <- byc[,"Pos Pred Value"]
+f1_per_class <- 2 * pre * rec / (pre + rec)
+macro_f1 <- mean(f1_per_class, na.rm = TRUE)
+
+list(
+  F1_per_class = f1_per_class,
+  Macro_F1 = macro_f1
+)
+```
+**General accuracy and agreement**:
+Accuracy = 0.9928 (95% CI 0.9907–0.9945), Kappa = 0.8994 – strong agreement with ground truth. <br>
+**Class-wise performance**:
+F1 ≈ 0.996 for Good and Poor; Fair F1 ≈ 0.827 due to lower precision. Balanced accuracy ~0.996. <br>
+**Interpretation and future steps**:
+Near-linear separation works well, but Fair–Good overlap persists. Precision for Fair could improve via threshold tuning, class weighting, or mild non-linear terms.
+
+```{r}
+if (exists("test_mlr")) {
+  eval_df <- test_mlr
+} else {
+  feat_names <- setdiff(colnames(mlr_model$trainingData), ".outcome")
+  eval_df <- test_data %>%
+    dplyr::select(any_of(c("class", feat_names))) %>%
+    mutate(class = factor(class, levels = levels(mlr_model$trainingData$.outcome))) %>%
+    na.omit()
+}
+
+# --- 1) predicted probabilities for each class
+pred_prob <- predict(mlr_model, newdata = eval_df, type = "prob")
+# ensure column order matches factor levels
+all_classes <- levels(eval_df$class)
+pred_prob   <- pred_prob[, all_classes, drop = FALSE]
+
+# --- 2) compute ROC/PR per class (one-vs-rest)
+roc_list <- list(); pr_list <- list()
+auc_results <- data.frame(Class=character(), ROC_AUC=numeric(), PR_AUC=numeric(), 
+                          stringsAsFactors = FALSE)
+
+for (cls in all_classes) {
+  # binary labels: current class = 1, others = 0
+  test_bin <- as.integer(eval_df$class == cls)
+  prob_cls <- pred_prob[[cls]]
+
+  # skip if no positives
+  if (sum(test_bin == 1) == 0 || sum(test_bin == 0) == 0) next
+
+  # ROC
+  roc_obj <- pROC::roc(response = test_bin, predictor = prob_cls, quiet = TRUE, direction = "<")
+  roc_auc <- as.numeric(pROC::auc(roc_obj))
+  roc_df  <- data.frame(
+    FPR   = 1 - roc_obj$specificities,
+    TPR   = roc_obj$sensitivities,
+    Class = cls
+  )
+  roc_list[[cls]] <- roc_df
+
+  # PR (PRROC: scores.class0 = positive-class scores; scores.class1 = negative-class scores)
+  pr_obj <- PRROC::pr.curve(scores.class0 = prob_cls[test_bin == 1],
+                            scores.class1 = prob_cls[test_bin == 0],
+                            curve = TRUE)
+  pr_auc <- as.numeric(pr_obj$auc.integral)
+  pr_df  <- data.frame(
+    Recall    = pr_obj$curve[, 1],
+    Precision = pr_obj$curve[, 2],
+    Class     = cls
+  )
+  pr_list[[cls]] <- pr_df
+
+  # collect AUCs
+  auc_results <- rbind(auc_results, data.frame(Class = cls, ROC_AUC = roc_auc, PR_AUC = pr_auc))
+}
+
+# --- 3) AUC table
+print(auc_results)
+```
+
+```{r}
+# --- 4) ROC plot (all classes)
+roc_long <- do.call(rbind, roc_list)
+p_roc <- ggplot(roc_long, aes(x = FPR, y = TPR, color = Class)) +
+  geom_line(size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = "ROC Curves — Multinomial Logistic Regression",
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal(base_size = 12)
+print(p_roc)
+```
+
+```{r}
+# --- 5) PR plot (all classes)
+pr_long <- do.call(rbind, pr_list)
+p_pr <- ggplot(pr_long, aes(x = Recall, y = Precision, color = Class)) +
+  geom_line(size = 1) +
+  labs(title = "Precision–Recall Curves — Multinomial Logistic Regression",
+       x = "Recall", y = "Precision") +
+  theme_minimal(base_size = 12)
+print(p_pr)
+```
+
+
+**ROC-AUC**: 
+Near-perfect separability for all classes (Good 0.99997, Fair 0.99971, Poor 1.000), with minimal false positives; slight variation due to class imbalance.
+**PR-AUC**:
+Excellent overall (Good 0.99999, Fair 0.9852, Poor 1.000); Fair shows minor precision drop at high recall. <br>
+**Overall interpretation**:
+The model achieves outstanding discrimination and balanced precision–recall; Fair’s slight precision loss reflects mild feature overlap. Temporal/spatial validation is recommended.
+
+
+
+## Linear Discriminant Analysis (LDA)
+
+```{r}
+pred_class <- predict(lda_model, newdata = test_data)
+pred_prob  <- predict(lda_model, newdata = test_data, type = "prob")
+
+cm <- confusionMatrix(pred_class, test_data$class)
+print(cm)
+acc      <- unname(cm$overall["Accuracy"])
+acc_low  <- unname(cm$overall["AccuracyLower"])
+acc_up   <- unname(cm$overall["AccuracyUpper"])
+kappa    <- unname(cm$overall["Kappa"])
+
+list(
+  Accuracy = acc,
+  Accuracy_95CI = c(acc_low, acc_up),
+  Kappa = kappa
+)
+
+byc <- as.data.frame(cm$byClass)
+
+byc_out <- byc[, c("Sensitivity","Pos Pred Value","Balanced Accuracy")]
+names(byc_out) <- c("Recall","Precision","Balanced_Accuracy")
+byc_out
+```
+
+
+**Overall Statistics**：Accuracy = 0.9022 (95% CI: 0.8955–0.9086), Kappa = 0.3692; performance limited by class imbalance (NIR = 0.9667). <br>
+**Statistics by Class**：
+•	Good: Recall 0.902, Precision 1.000, Balanced Accuracy 0.951 → excellent detection.
+•	Fair: Recall 0.849, Precision 0.134, Balanced Accuracy 0.876 → high recall but poor precision.
+•	Poor: Recall 0.977, Precision 0.857, Balanced Accuracy 0.987 → strong detection. <br>
+**Summary**：
+Performs well for Good and Poor; Fair suffers from low precision due to imbalance.
+
+
+```{r}
+rec <- byc[,"Sensitivity"]
+pre <- byc[,"Pos Pred Value"]
+f1_per_class <- 2 * pre * rec / (pre + rec)
+macro_f1 <- mean(f1_per_class, na.rm = TRUE)
+
+list(
+  F1_per_class = f1_per_class,
+  Macro_F1 = macro_f1
+)
+```
+**Macro-F1 = 0.6975 **: reduced mainly by the weak performance on the minority “Fair” class.
+•	Good: 0.948 – near-perfect
+•	Fair: 0.231 – low precision, many false positives
+•	Poor: 0.913 – strong balance
+
+
+```{r}
+classes <- levels(test_data$class)
+
+# ROC-AUC
+roc_auc <- sapply(classes, function(cls) {
+  y_bin <- as.numeric(test_data$class == cls)             
+  roc_obj <- pROC::roc(response = y_bin, predictor = pred_prob[[cls]], quiet = TRUE)
+  as.numeric(pROC::auc(roc_obj))
+})
+
+# PR-AUC
+pr_auc <- sapply(classes, function(cls) {
+  pos <- pred_prob[[cls]][test_data$class == cls]         
+  neg <- pred_prob[[cls]][test_data$class != cls]         
+  pr  <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = FALSE)
+  unname(pr$auc.integral)
+})
+
+auc_tbl <- data.frame(
+  Class   = classes,
+  ROC_AUC = as.numeric(roc_auc),
+  PR_AUC  = as.numeric(pr_auc)
+) %>%
+  mutate(
+    ROC_AUC = round(ROC_AUC, 7),
+    PR_AUC  = round(PR_AUC, 7)
+  )
+
+print(auc_tbl, row.names = FALSE)
+```
+
+```{r}
+# Extract ROC curve coordinates (FPR, TPR) for each category
+roc_df <- do.call(rbind, lapply(classes, function(cls){
+  y_bin  <- as.numeric(test_data$class == cls)
+  rocobj <- pROC::roc(response = y_bin, predictor = pred_prob[[cls]], quiet = TRUE)
+  aucv   <- as.numeric(pROC::auc(rocobj))
+  crd    <- as.data.frame(pROC::coords(rocobj, x = "all",
+                                       ret = c("specificity","sensitivity"),
+                                       transpose = FALSE))
+  data.frame(
+    Class = cls,
+    FPR   = 1 - crd$specificity,
+    TPR   = crd$sensitivity,
+    ROC_AUC = aucv
+  )
+}))
+
+# Merge on the auc_tbl
+roc_df <- roc_df %>%
+  left_join(auc_tbl[, c("Class","ROC_AUC")], by = "Class", suffix = c("", ".calc")) %>%
+  mutate(ROC_AUC = coalesce(ROC_AUC.calc, ROC_AUC),
+         ClassLab = paste0(Class, " (AUC=", sprintf("%.4f", ROC_AUC), ")"))
+
+# plot ROC
+p_roc <- ggplot(roc_df, aes(x = FPR, y = TPR, color = ClassLab)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_equal() +
+  labs(title = "ROC Curves (One-vs-Rest) - LDA",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)",
+       color = "Class (AUC)") +
+  theme_minimal(base_size = 13)
+print(p_roc)
+```
+
+```{r}
+pr_df <- do.call(rbind, lapply(classes, function(cls){
+  pos <- pred_prob[[cls]][test_data$class == cls]
+  neg <- pred_prob[[cls]][test_data$class != cls]
+  pr  <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = TRUE)
+  data.frame(
+    Class = cls,
+    Recall    = pr$curve[,1],
+    Precision = pr$curve[,2],
+    PR_AUC    = unname(pr$auc.integral)
+  )
+}))
+
+# Merge on PR-AUC
+pr_df <- pr_df %>%
+  left_join(auc_tbl[, c("Class","PR_AUC")], by = "Class", suffix = c("", ".calc")) %>%
+  mutate(PR_AUC = coalesce(PR_AUC.calc, PR_AUC),
+         ClassLab = paste0(Class, " (PR-AUC=", sprintf("%.4f", PR_AUC), ")"))
+
+# plot PR
+p_pr <- ggplot(pr_df, aes(x = Recall, y = Precision, color = ClassLab)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Precision–Recall Curves (One-vs-Rest) - LDA",
+       x = "Recall", y = "Precision",
+       color = "Class (PR-AUC)") +
+  theme_minimal(base_size = 13)
+print(p_pr)
+```
+**ROC-AUC**：
+Good 0.9999, Fair 0.9171, Poor 0.9996 – excellent separation for Good and Poor; Fair weaker. 
+**PR-AUC**：
+Good 0.999997, Fair 0.0884, Poor 0.9744 – high precision/recall for Good and Poor; Fair suffers from many false positives. <br>
+**Overall**：
+Model excels on Good and Poor but struggles with Fair due to class imbalance.
+
+
+
+
+
+
+
+
+
+## Support Vector Machine (SVM)
+
+This section evaluates already-fitted models on the same held-out test set.  
+It reports overall metrics (**Accuracy, Kappa, Macro-F1**) and class-wise metrics (**Precision, Recall, F1**), and includes quick visuals.  
+
+```{r perf_eval, echo=TRUE, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(caret); library(ggplot2); library(knitr); library(tibble)
+})
+
+eval_model <- function(model, name, test_df = test_data) {
+  stopifnot("class" %in% names(test_df))
+
+  req <- setdiff(colnames(model$trainingData), ".outcome")
+
+  for (v in req) {
+    if (!v %in% names(test_df)) {
+      tr_col <- model$trainingData[[v]]
+      if (is.factor(tr_col)) {
+        test_df[[v]] <- factor(rep(levels(tr_col)[1], nrow(test_df)), levels = levels(tr_col))
+      } else {
+        test_df[[v]] <- 0
+      }
+    }
+  }
+
+  # 3) coerce factor levels in test_df to match the model (important for caret)
+  xl <- try(model$finalModel$xlevels, silent = TRUE)
+  if (!inherits(xl, "try-error") && !is.null(xl)) {
+    for (nm in names(xl)) {
+      if (nm %in% names(test_df)) {
+        test_df[[nm]] <- factor(as.character(test_df[[nm]]), levels = xl[[nm]])
+      }
+    }
+  }
+
+  use_cols <- c("class", req)
+  use_cols <- use_cols[use_cols %in% names(test_df)]
+  newdata  <- test_df[, use_cols, drop = FALSE]
+
+  pred <- predict(model, newdata = newdata)
+  cm   <- confusionMatrix(pred, test_df$class)
+
+  byc <- as.data.frame(cm$byClass)[, c("Precision","Recall","F1")]
+  overall <- data.frame(
+    Model    = name,
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Kappa    = unname(cm$overall["Kappa"]),
+    Macro_F1 = mean(byc$F1, na.rm = TRUE),
+    row.names = NULL, check.names = FALSE
+  )
+  per_class <- byc |>
+    tibble::rownames_to_column("Class") |>
+    dplyr::mutate(Model = name, .before = 1) |>
+    dplyr::select(Model, Class, Precision, Recall, F1)
+
+  list(overall = overall, per_class = per_class)
+}
+
+
+res_list <- list()
+if (exists("svm_tune"))      res_list$SVM   <- eval_model(svm_tune,  "SVM (RBF, tuned)")
+if (exists("svm_base"))      res_list$SVM0  <- eval_model(svm_base,  "SVM (no-CV baseline)")
+if (exists("nb_model_tune")) res_list$NB    <- eval_model(nb_model_tune, "Naive Bayes (tuned)")
+if (exists("knn_tune"))      res_list$KNN   <- eval_model(knn_tune,  "KNN (tuned)")
+
+stopifnot(length(res_list) > 0)
+
+overall_tbl   <- dplyr::bind_rows(lapply(res_list, `[[`, "overall")) |> dplyr::arrange(dplyr::desc(Accuracy))
+per_class_tbl <- dplyr::bind_rows(lapply(res_list, `[[`, "per_class"))
+
+cat("**Overall metrics (held-out test set)**\n")
+overall_print <- overall_tbl %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 4)))
+knitr::kable(overall_print)
+
+cat("\n**Per-class metrics (held-out test set)**\n")
+per_class_print <- per_class_tbl %>% dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 4)))
+knitr::kable(per_class_print)
+
+```
+The tuned RBF-SVM markedly outperforms the baseline: Accuracy 0.9928->0.9975, Kappa 0.8772->0.9607, Macro-F1 0.9091->0.9731. <br>
+**Class-wise performance:**
+•	Good: F1 ≈ 0.999 (stable).
+•	Fair: Recall 0.6043->0.8849, F1 0.7500->0.9283, with minimal precision drop.
+•	Poor: Precision 0.9769->1.0000, F1 0.9807->0.9922. <br>
+Overall, the tuned model shows stronger agreement and better balance across classes, especially a major Fair recall gain.
+Recommendation: Adopt the tuned SVM; minor threshold tuning may further refine Fair precision–recall trade-offs.
+
+
+
+
+
+
+
+
+
+
+
+
+## K-nearest Neighbors (KNN)
+```{r}
+pred_class <- predict(knn_model, newdata = test_data)
+pred_prob  <- predict(knn_model, newdata = test_data, type = "prob")
+
+cm <- confusionMatrix(pred_class, test_data$class)
+print(cm)
+acc      <- unname(cm$overall["Accuracy"])
+acc_low  <- unname(cm$overall["AccuracyLower"])
+acc_up   <- unname(cm$overall["AccuracyUpper"])
+kappa    <- unname(cm$overall["Kappa"])
+
+list(
+  Accuracy = acc,
+  Accuracy_95CI = c(acc_low, acc_up),
+  Kappa = kappa
+)
+
+byc <- as.data.frame(cm$byClass)
+
+byc_out <- byc[, c("Sensitivity","Pos Pred Value","Balanced Accuracy")]
+names(byc_out) <- c("Recall","Precision","Balanced_Accuracy")
+byc_out 
+
+
+```
+**Overall Statistics**:
+Accuracy = 0.9380 (95% CI: 0.9325–0.9432); Kappa = 0.4736, showing moderate agreement and stable performance.
+Although below the majority-class baseline (NIR = 0.9667), the model effectively captures minority classes. <br>
+**Statistics by Class**
+•	Good: Recall 0.943, Precision 1.000 — near-perfect recognition.
+•	Fair: Recall 0.806, Precision 0.197 — strong recall but low precision due to overlap with Good.
+•	Poor: Recall 0.806, Precision 0.712 — balanced and reliable detection. <br>
+**Summary:** The tuned KNN delivers high accuracy and consistent class balance, excelling on Good and Poor but still challenged by Fair due to class imbalance and feature similarity.
+
+
+```{r}
+rec <- byc[,"Sensitivity"]
+pre <- byc[,"Pos Pred Value"]
+f1_per_class <- 2 * pre * rec / (pre + rec)
+macro_f1 <- mean(f1_per_class, na.rm = TRUE)
+
+list(
+  F1_per_class = f1_per_class,
+  Macro_F1 = macro_f1
+)
+
+```
+**Macro-F1**: 0.681
+	•	Good: 0.970 — Excellent, driven by perfect precision and high recall.
+	•	Fair: 0.317 — Weak, mainly from low precision and many false positives.
+	•	Poor: 0.756 — Balanced precision–recall trade-off.
+Overall, strong performance on Good, but Fair’s low F1 drags down the macro average, reflecting continued difficulty with minority class detection.
+	
+	
+```{r}
+
+classes <- levels(test_data$class )
+#ROC-AUC
+roc_auc <- sapply(classes, function(cls) {
+  y_bin <- as.numeric(test_data$class  == cls)             
+  roc_obj <- pROC::roc(response = y_bin, predictor = pred_prob[[cls]], quiet = TRUE)
+  as.numeric(pROC::auc(roc_obj))
+})
+
+#PR-AUC
+pr_auc <- sapply(classes, function(cls) {
+  pos <- pred_prob[[cls]][test_data$class  == cls]         
+  neg <- pred_prob[[cls]][test_data$class  != cls]         
+  pr  <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = FALSE)
+  unname(pr$auc.integral)
+})
+
+
+auc_tbl <- data.frame(
+  Class   = classes,
+  ROC_AUC = as.numeric(roc_auc),
+  PR_AUC  = as.numeric(pr_auc)
+) %>%
+  mutate(
+    ROC_AUC = round(ROC_AUC, 7),
+    PR_AUC  = round(PR_AUC, 7)
+  )
+
+print(auc_tbl, row.names = FALSE)
+
+
+```
+```{r}
+
+# Extract ROC curve coordinates (FPR, TPR) for each category
+roc_df <- do.call(rbind, lapply(classes, function(cls){
+  y_bin  <- as.numeric(test_data$class == cls)
+  rocobj <- pROC::roc(response = y_bin, predictor = pred_prob[[cls]], quiet = TRUE)
+  aucv   <- as.numeric(pROC::auc(rocobj))
+  crd    <- as.data.frame(pROC::coords(rocobj, x = "all",
+                                       ret = c("specificity","sensitivity"),
+                                       transpose = FALSE))
+  data.frame(
+    Class = cls,
+    FPR   = 1 - crd$specificity,
+    TPR   = crd$sensitivity,
+    ROC_AUC = aucv
+  )
+}))
+
+# Merge on the auc_tbl
+roc_df <- roc_df %>%
+  left_join(auc_tbl[, c("Class","ROC_AUC")], by = "Class", suffix = c("", ".calc")) %>%
+  mutate(ROC_AUC = coalesce(ROC_AUC.calc, ROC_AUC),
+         ClassLab = paste0(Class, " (AUC=", sprintf("%.4f", ROC_AUC), ")"))
+
+# plot ROC
+p_roc <- ggplot(roc_df, aes(x = FPR, y = TPR, color = ClassLab)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_equal() +
+  labs(title = "ROC Curves (One-vs-Rest)",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)",
+       color = "Class (AUC)") +
+  theme_minimal(base_size = 13)
+print(p_roc)
+
+
+```
+```{r}
+pr_df <- do.call(rbind, lapply(classes, function(cls){
+  pos <- pred_prob[[cls]][test_data$class == cls]
+  neg <- pred_prob[[cls]][test_data$class != cls]
+  pr  <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = TRUE)
+  data.frame(
+    Class = cls,
+    Recall    = pr$curve[,1],
+    Precision = pr$curve[,2],
+    PR_AUC    = unname(pr$auc.integral)
+  )
+}))
+
+# Merge on PR-AUC
+pr_df <- pr_df %>%
+  left_join(auc_tbl[, c("Class","PR_AUC")], by = "Class", suffix = c("", ".calc")) %>%
+  mutate(PR_AUC = coalesce(PR_AUC.calc, PR_AUC),
+         ClassLab = paste0(Class, " (PR-AUC=", sprintf("%.4f", PR_AUC), ")"))
+
+# plot PR
+p_pr <- ggplot(pr_df, aes(x = Recall, y = Precision, color = ClassLab)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Precision–Recall Curves (One-vs-Rest)",
+       x = "Recall", y = "Precision",
+       color = "Class (PR-AUC)") +
+  theme_minimal(base_size = 13)
+print(p_pr)
+
+
+```
+**ROC-AUC**: Good = 0.989, Fair = 0.954, Poor = 0.986 — all show strong separability, with minor overlap for Fair. 
+**PR-AUC**: Good = 0.9996 (near-perfect), Fair = 0.256 (very low, poor precision), Poor = 0.830 (balanced). <br>
+**Overall Interpretation**: Excellent discrimination overall, but Fair remains hard to identify due to imbalance and low precision.
+
+
+
+
+
+## Naive Bayes
+
+
+```{r}
+# Train Naive Bayes model with hyperparameter tuning
+nb_model_tuned <- train(
+  class ~ .,
+  data = train_data_balanced,
+  method = "naive_bayes",
+  trControl = train_control,
+  tuneGrid = nb_grid
+)
+
+# Evaluate the tuned model on the **original imbalanced test set**
+# to assess its real-world generalization performance
+pred_class <- predict(nb_model_tuned, newdata = test_data)
+pred_prob  <- predict(nb_model_tuned, newdata = test_data, type = "prob")
+
+# Generate and print confusion matrix
+cm_tuned <- confusionMatrix(pred_class, test_data$class)
+print(cm_tuned)
+```
+**Overall Statistics**:
+Accuracy = 0.9818 (95% CI: 0.9787–0.9846) — excellent and stable.
+Kappa = 0.7786 — substantial agreement across classes. <br>
+**Statistics by Class**:
+Good (96.7%): Recall = 0.982, Precision = 1.000 — near-perfect.
+Fair (1.7%): Recall = 1.000, Precision = 0.513 — all detected but many false positives.
+Poor (1.6%): Recall = 0.985, Precision = 0.901 — strong and balanced. <br>
+**Summary**:
+High overall accuracy and recall across all classes; Fair precision remains affected by class imbalance.
+
+```{r}
+# Macro-F1 Score (manual for multiclass)
+classes <- levels(test_data$class)
+f1_list <- sapply(classes, function(cl) {
+  true_bin <- factor(ifelse(test_data$class == cl, 1, 0))
+  pred_bin <- factor(ifelse(pred_class == cl, 1, 0))
+  tp <- sum(pred_bin == 1 & true_bin == 1)
+  fp <- sum(pred_bin == 1 & true_bin == 0)
+  fn <- sum(pred_bin == 0 & true_bin == 1)
+  if(tp + fp == 0 || tp + fn == 0) return(0)
+  2 * tp / (2*tp + fp + fn)
+})
+macro_f1 <- mean(f1_list)
+cat("Macro-F1:", macro_f1, "\n")
+```
+**Macro-F1 = 0.8698**: Indicates that the model achieves a strong overall balance between precision and recall across all three classes.
+
+
+
+
+
+```{r}
+all_classes <- c("Good", "Fair", "Poor")
+
+roc_list <- list()
+pr_list <- list()
+auc_results <- data.frame(Class=character(), ROC_AUC=numeric(), PR_AUC=numeric(), stringsAsFactors=FALSE)
+
+for(cls in all_classes){
+  
+  # Create binary labels: current class = 1, others = 0
+  test_bin <- ifelse(test_data$class == cls, 1, 0)
+  prob_cls <- pred_prob[, cls]
+  
+  # Compute ROC
+  roc_obj <- roc(test_bin, prob_cls)
+  roc_list[[cls]] <- roc_obj
+  roc_auc <- auc(roc_obj)
+  
+  # Compute PR
+  pr_obj <- pr.curve(scores.class0 = prob_cls[test_bin==1],
+                     scores.class1 = prob_cls[test_bin==0],
+                     curve = TRUE)
+  pr_list[[cls]] <- pr_obj
+  pr_auc <- pr_obj$auc.integral
+  
+  # Save results
+  auc_results <- rbind(auc_results, data.frame(Class=cls, ROC_AUC=roc_auc, PR_AUC=pr_auc))
+}
+
+# Print AUC table
+print(auc_results)
+
+# Plot ROC curves for all classes
+roc_plot <- ggplot() +
+  geom_line(data = data.frame(fpr=roc_list[["Good"]]$specificities, tpr=roc_list[["Good"]]$sensitivities),
+            aes(x=1-fpr, y=tpr), color="green", size=1) +
+  geom_line(data = data.frame(fpr=roc_list[["Fair"]]$specificities, tpr=roc_list[["Fair"]]$sensitivities),
+            aes(x=1-fpr, y=tpr), color="blue", size=1) +
+  geom_line(data = data.frame(fpr=roc_list[["Poor"]]$specificities, tpr=roc_list[["Poor"]]$sensitivities),
+            aes(x=1-fpr, y=tpr), color="red", size=1) +
+  geom_abline(slope=1, intercept=0, linetype="dashed") +
+  labs(title="ROC Curve for All Classes", x="False Positive Rate", y="True Positive Rate") +
+  theme_minimal()
+print(roc_plot)
+
+# Plot PR curves for all classes
+pr_plot <- ggplot() +
+  geom_line(data = data.frame(recall=pr_list[["Good"]]$curve[,1], precision=pr_list[["Good"]]$curve[,2]),
+            aes(x=recall, y=precision), color="green", size=1) +
+  geom_line(data = data.frame(recall=pr_list[["Fair"]]$curve[,1], precision=pr_list[["Fair"]]$curve[,2]),
+            aes(x=recall, y=precision), color="blue", size=1) +
+  geom_line(data = data.frame(recall=pr_list[["Poor"]]$curve[,1], precision=pr_list[["Poor"]]$curve[,2]),
+            aes(x=recall, y=precision), color="red", size=1) +
+  labs(title="PR Curve for All Classes", x="Recall", y="Precision") +
+  theme_minimal()
+print(pr_plot)
+```
+**ROC-AUC**:
+All classes show near-perfect separability (0.9985–0.9999), with Fair and Poor performing comparably to Good. 
+**PR-AUC**:
+Good 0.99996, Fair 0.9110, Poor 0.9986 – strong precision–recall, slight Fair precision loss. <br>
+**Overall Interpretation**:
+The tuned Naive Bayes shows near-perfect class separation and robust generalization, with minor Fair-class precision issues.
+
+
+
+# Conclusion
+
+## Model Comparison
+**Overall Performance** <br>
+**SVM (RBF, tuned)** achieves the best overall results, with Accuracy = 0.9975, Kappa = 0.9607, and Macro-F1 = 0.9731.
+It provides superior balance across all classes, especially with a major improvement in Fair recall (0.60 -> 0.88) and stable Poor performance.
+-> **Best model overall**. <br>
+**Multinomial Logistic Regression** performs nearly as well (Accuracy = 0.9928, Macro-F1 = 0.940), showing that linear boundaries already capture most patterns.
+Its limitation lies mainly in distinguishing Fair from Good, indicating partial class overlap.
+-> **Strong linear baseline**. <br>
+**Naive Bayes (tuned)** also yields excellent discrimination (Accuracy = 0.9818, Macro-F1 = 0.870, ROC-AUC ≈ 0.999), proving highly effective under class imbalance, though Fair precision remains moderate.
+-> **Efficient and generalisable**. <br>
+**KNN (tuned)** shows reasonable accuracy (0.938, Macro-F1 = 0.681) but weak precision for Fair (0.20).
+It identifies most minority samples but often mislabels Good as Fair.
+-> **Acceptable but less discriminative**. <br>
+**LDA** performs the weakest (Accuracy = 0.902, Macro-F1 = 0.698).
+It classifies the majority Good class well but misclassifies many Fair samples, confirming limited flexibility of linear covariance-based boundaries.
+-> **Limited by class imbalance**. <br>
+All models show **very high ROC-AUC values**, confirming that feature engineering successfully enables linear or quasi-linear separation.
+However, **Precision–Recall (PR-AUC)** reveals a consistent challenge for the Fair class — the minority category — where precision frequently drops despite good recall.
+
+
+## Overall Summary
+**Best choice: Tuned RBF-SVM**, combining top accuracy, high agreement, and balanced class recall. <br>
+**Alternative light-weight option: Naive Bayes**, offering strong performance and simplicity. <br>
+**Baseline reference: Multinomial Logistic Regression**, nearly optimal with interpretable coefficients. <br>
+**LDA and KNN** underperform due to sensitivity to class imbalance and feature-scale effects. <br>
+Future work should focus on class rebalancing, threshold optimisation, and temporal validation to ensure generalisation across varying data distributions.
+
+
+
+
+
+
+
+
+
+
+# Appendix
+
+## Dataset References 
+The two datasets (water_quality.csv and weather.csv) used in this project originate from publicly available water quality monitoring initiatives in Sydney, New South Wales, Australia. Specifically, the data are sourced from: 
+
+New South Wales Department of Planning and Environment 2025, Beachwatch water quality data portal, NSW Government, viewed 11 September 2025, https://www.beachwatch.nsw.gov.au/waterMonitoring/waterQualityData. 
+
+
+
+## Data Dictionary 
+Dataset after Feature Engineering 
+
+| No. | Attribute               | Data Type | Description                                                                 |
+|-----|-------------------------|-----------|-----------------------------------------------------------------------------|
+| 1   | region                  | str       | Name of the region (e.g., "Western Sydney" "Sydney Harbour" ) where the sampling site is located. |
+| 2   | council                 | str       | Local council name (e.g., "Hawkesbury City Council" "North Sydney Council" ) responsible for the area of the sampling site. |
+| 3   | swim_site               | str       | Name of the swimming or sampling site (e.g., "Windsor Beach" "Hayes Street Beach"). |
+| 4   | time                    | str       | Time of sample collection in HH:MM:SS format.                               |
+| 5   | enterococci_cfu_100ml   | int       | Count of Enterococci bacteria per 100 mL of water, used as an indicator of water quality and safety. |
+| 6   | water_temperature_c     | int       | Water temperature (°C) at the time of sampling.                             |
+| 7   | conductivity_ms_cm      | int       | Water conductivity (mS/cm), measuring dissolved salts and minerals.         |
+| 8   | latitude.x              | float     | Latitude coordinate of the swimming site.                                   |
+| 9   | longitude.x             | float     | Longitude coordinate of the swimming site.                                  |
+| 10  | max_temp_C              | float     | Daily maximum air temperature (°C).                                         |
+| 11  | min_temp_C              | float     | Daily minimum air temperature (°C).                                         |
+| 12  | precipitation_mm        | float     | Daily precipitation (mm).                                                   |
+| 13  | year                    | int       | Year of sample collection (e.g., 2008 – 2025)                               |
+| 14  | month                   | int       | Month of sample collection (1–12)                                           |
+| 15  | class                   | str       | Water quality category: "Good", "Fair", "Poor"                              |
+| 16  | log_enterococci         | float     | Log-transformed Enterococci count for modeling                              |
+| 17  | yeojohnson_precip       | float     | Yeo-Johnson transformed precipitation to reduce skewness                    |
+| 18  | temp_ec_interact        | float     | Interaction between water temp and enterococci                              |
+| 19  | temp_diff               | float     | Difference between daily max and min air temp in (°C)                       |
+| 20  | season                  | str       | Season of collection: "Summer", "Autumn", "Winter", "Spring"                |
